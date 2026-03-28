@@ -6,6 +6,9 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[cfg(feature = "zerolease")]
+use zerolease_provider::{CredentialProvider, CredentialRequest};
+
 const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
@@ -35,6 +38,10 @@ pub struct JiraTool {
     http: Client,
     security: Arc<SecurityPolicy>,
     timeout_secs: u64,
+    #[cfg(feature = "zerolease")]
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
+    #[cfg(feature = "zerolease")]
+    agent_id: Option<String>,
 }
 
 impl JiraTool {
@@ -54,7 +61,66 @@ impl JiraTool {
             http: Client::new(),
             security,
             timeout_secs,
+            #[cfg(feature = "zerolease")]
+            credential_provider: None,
+            #[cfg(feature = "zerolease")]
+            agent_id: None,
         }
+    }
+
+    /// Attach a zerolease credential provider. When set, credentials are
+    /// acquired per-request instead of using the static `api_token` field.
+    #[cfg(feature = "zerolease")]
+    pub fn with_credential_provider(
+        mut self,
+        provider: Arc<dyn CredentialProvider>,
+        agent_id: String,
+    ) -> Self {
+        self.credential_provider = Some(provider);
+        self.agent_id = Some(agent_id);
+        self
+    }
+
+    /// Apply authentication to a request builder.
+    ///
+    /// When a zerolease credential provider is configured, acquires a
+    /// credential per-request and applies it via `basic_auth`. Falls
+    /// back to the static `api_token` field otherwise.
+    async fn send_authenticated(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, anyhow::Error> {
+        #[cfg(feature = "zerolease")]
+        if let (Some(provider), Some(agent_id)) = (&self.credential_provider, &self.agent_id) {
+            let domain = self
+                .base_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .split('/')
+                .next()
+                .unwrap_or(&self.base_url);
+            let guard = provider
+                .acquire(CredentialRequest {
+                    secret_name: "jira-api-token".to_string(),
+                    target_domain: domain.to_string(),
+                    agent_id: agent_id.clone(),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))?;
+            let authed = guard.expose(|token| builder.basic_auth(&self.email, Some(token)));
+            return authed
+                .timeout(std::time::Duration::from_secs(self.timeout_secs))
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("request failed: {e}"));
+        }
+
+        builder
+            .basic_auth(&self.email, Some(&self.api_token))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("request failed: {e}"))
     }
 
     fn is_action_allowed(&self, action: &str) -> bool {
@@ -94,12 +160,7 @@ impl JiraTool {
         };
 
         let resp = self
-            .http
-            .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .query(&query)
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
+            .send_authenticated(self.http.get(&url).query(&query))
             .await
             .map_err(|e| anyhow::anyhow!("Jira get_ticket request failed: {e}"))?;
 
@@ -159,12 +220,7 @@ impl JiraTool {
             }
 
             let resp = self
-                .http
-                .post(&url)
-                .basic_auth(&self.email, Some(&self.api_token))
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(self.timeout_secs))
-                .send()
+                .send_authenticated(self.http.post(&url).json(&body))
                 .await
                 .map_err(|e| anyhow::anyhow!("Jira search_tickets request failed: {e}"))?;
 
@@ -224,12 +280,7 @@ impl JiraTool {
 
         let url = format!("{}/rest/api/3/issue/{}/comment", self.base_url, issue_key);
         let resp = self
-            .http
-            .post(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .json(&json!({ "body": adf }))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
+            .send_authenticated(self.http.post(&url).json(&json!({ "body": adf })))
             .await
             .map_err(|e| anyhow::anyhow!("Jira comment_ticket request failed: {e}"))?;
 
@@ -259,11 +310,7 @@ impl JiraTool {
         let url = format!("{}/rest/api/3/project", self.base_url);
 
         let resp = self
-            .http
-            .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
+            .send_authenticated(self.http.get(&url))
             .await
             .map_err(|e| anyhow::anyhow!("Jira list_projects request failed: {e}"))?;
 
@@ -294,15 +341,10 @@ impl JiraTool {
         );
 
         let users_resp = self
-            .http
-            .get(&users_url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .query(&[
+            .send_authenticated(self.http.get(&users_url).query(&[
                 ("projectKeys", keys.join(",").as_str()),
                 ("maxResults", "50"),
-            ])
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
+            ]))
             .await
             .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
 
@@ -387,11 +429,7 @@ impl JiraTool {
         let url = format!("{}/rest/api/3/myself", self.base_url);
 
         let resp = self
-            .http
-            .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
+            .send_authenticated(self.http.get(&url))
             .await
             .map_err(|e| anyhow::anyhow!("Jira myself request failed: {e}"))?;
 
@@ -426,12 +464,7 @@ impl JiraTool {
     async fn resolve_email(&self, email: &str) -> Option<(String, String)> {
         let url = format!("{}/rest/api/3/user/search", self.base_url);
         let result = self
-            .http
-            .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .query(&[("query", email)])
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
+            .send_authenticated(self.http.get(&url).query(&[("query", email)]))
             .await
             .ok()?
             .json::<Value>()
@@ -1519,5 +1552,78 @@ mod tests {
     fn shape_projects_empty_inputs() {
         let shaped = shape_projects(&[], &[]);
         assert_eq!(shaped.len(), 0);
+    }
+
+    /// Proves JiraTool can acquire credentials through a `CredentialProvider`
+    /// instead of using static fields. The HTTP request will fail (no real
+    /// Jira server) but the credential acquisition path is exercised.
+    #[cfg(feature = "zerolease")]
+    #[tokio::test]
+    async fn execute_with_credential_provider_acquires_from_provider() {
+        let mut provider = zerolease_provider::StaticProvider::new();
+        provider.insert("jira-api-token", "vault-provided-token");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            // Use a non-routable address so we get a connection error, not a DNS lookup
+            "https://127.0.0.1:1".into(),
+            "test@example.com".into(),
+            "static-token-should-not-be-used".into(),
+            vec!["myself".into()],
+            security,
+            2,
+        )
+        .with_credential_provider(Arc::new(provider), "test-agent".into());
+
+        let result = tool
+            .execute(serde_json::json!({ "action": "myself" }))
+            .await
+            .expect("execute should return Ok(ToolResult) even on HTTP failure");
+
+        // The tool wraps errors in ToolResult. The error should be a
+        // connection error, NOT a credential error — proving the credential
+        // was successfully acquired from the provider.
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            !err.contains("credential"),
+            "expected connection error, got credential error: {err}"
+        );
+    }
+
+    /// Proves that `StaticProvider` returns an error for unknown secrets.
+    #[cfg(feature = "zerolease")]
+    #[tokio::test]
+    async fn credential_provider_rejects_unknown_secret() {
+        let provider = zerolease_provider::StaticProvider::new(); // empty
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://127.0.0.1:1".into(),
+            "test@example.com".into(),
+            "unused".into(),
+            vec!["myself".into()],
+            security,
+            2,
+        )
+        .with_credential_provider(Arc::new(provider), "test-agent".into());
+
+        let result = tool
+            .execute(serde_json::json!({ "action": "myself" }))
+            .await
+            .expect("execute should return Ok(ToolResult) even on credential failure");
+
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("credential"),
+            "expected credential error for missing secret, got: {err}"
+        );
     }
 }
