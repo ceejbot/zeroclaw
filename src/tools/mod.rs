@@ -620,14 +620,26 @@ pub fn all_tools_with_runtime(
         } else if root_config.jira.email.trim().is_empty() {
             tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
         } else {
-            tool_arcs.push(Arc::new(JiraTool::new(
+            let jira = JiraTool::new(
                 root_config.jira.base_url.trim().to_string(),
                 root_config.jira.email.trim().to_string(),
                 api_token,
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
-            )));
+            );
+            #[cfg(feature = "zerolease")]
+            let jira = if root_config.zerolease.enabled
+                && !root_config.zerolease.socket_path.is_empty()
+            {
+                let provider = Arc::new(
+                    zerolease_provider::ZeroleaseProvider::new(&root_config.zerolease.socket_path),
+                );
+                jira.with_credential_provider(provider, root_config.zerolease.agent_id.clone())
+            } else {
+                jira
+            };
+            tool_arcs.push(Arc::new(jira));
         }
     }
 
