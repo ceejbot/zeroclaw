@@ -425,6 +425,10 @@ pub struct Config {
     #[nested]
     pub jira: JiraConfig,
 
+    /// Zerolease vault credential provider configuration (`[zerolease]`).
+    #[serde(default)]
+    pub zerolease: ZeroleaseConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     #[nested]
@@ -8589,6 +8593,39 @@ fn default_jira_timeout_secs() -> u64 {
     30
 }
 
+// ── Zerolease vault credential provider ─────────────────────────────
+
+/// Configuration for the zerolease vault-backed credential provider (`[zerolease]`).
+///
+/// When enabled, tools that support it will acquire credentials per-request
+/// from a zerolease vault rather than storing them as static fields.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ZeroleaseConfig {
+    /// Enable zerolease credential provider. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the zerolease vault Unix domain socket.
+    #[serde(default)]
+    pub socket_path: String,
+    /// Agent identity sent with credential requests. Default: `"zeroclaw-agent"`.
+    #[serde(default = "default_zerolease_agent_id")]
+    pub agent_id: String,
+}
+
+fn default_zerolease_agent_id() -> String {
+    "zeroclaw-agent".into()
+}
+
+impl Default for ZeroleaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: String::new(),
+            agent_id: default_zerolease_agent_id(),
+        }
+    }
+}
+
 impl Default for JiraConfig {
     fn default() -> Self {
         Self {
@@ -8922,6 +8959,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            zerolease: ZeroleaseConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -11410,6 +11448,7 @@ auto_save = true
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            zerolease: ZeroleaseConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -11940,6 +11979,7 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            zerolease: ZeroleaseConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),

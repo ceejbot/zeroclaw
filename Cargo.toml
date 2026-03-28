@@ -34,8 +34,11 @@ name = "zeroclaw"
 path = "src/lib.rs"
 
 [dependencies]
+# Credential provider (optional, for zerolease vault integration)
+zerolease-provider = { path = "../zerolease/crates/zerolease-provider", features = ["vault"], optional = true }
 # Internal proc macros
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.1.0" }
+
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
@@ -272,6 +275,8 @@ skill-creation = []
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 # voice-wake = Voice wake word detection via microphone (cpal)
 voice-wake = ["dep:cpal"]
+# Zerolease vault-backed credential provider for tools
+zerolease = ["dep:zerolease-provider"]
 # WASM plugin system (extism-based)
 plugins-wasm = ["dep:extism"]
 # WebAuthn / FIDO2 hardware key authentication
