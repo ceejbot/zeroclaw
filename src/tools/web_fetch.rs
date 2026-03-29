@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
+use zerolease_provider::{AgentId, CredentialProvider, CredentialRequest, DomainScope, SecretName};
 
 /// Minimum body length to consider a standard fetch successful.
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
@@ -28,6 +29,8 @@ pub struct WebFetchTool {
     max_response_size: usize,
     timeout_secs: u64,
     firecrawl: FirecrawlConfig,
+    credential_provider: Arc<dyn CredentialProvider>,
+    agent_id: String,
 }
 
 impl WebFetchTool {
@@ -39,6 +42,8 @@ impl WebFetchTool {
         timeout_secs: u64,
         firecrawl: FirecrawlConfig,
         allowed_private_hosts: Vec<String>,
+        credential_provider: Arc<dyn CredentialProvider>,
+        agent_id: String,
     ) -> Self {
         Self {
             security,
@@ -48,6 +53,8 @@ impl WebFetchTool {
             max_response_size,
             timeout_secs,
             firecrawl,
+            credential_provider,
+            agent_id,
         }
     }
 
@@ -110,12 +117,29 @@ impl WebFetchTool {
 
     /// Fetch content via the Firecrawl API.
     async fn fetch_via_firecrawl(&self, url: &str) -> anyhow::Result<ToolResult> {
-        let api_key = std::env::var(&self.firecrawl.api_key_env).map_err(|_| {
-            anyhow::anyhow!(
-                "Firecrawl API key not found in environment variable '{}'",
-                self.firecrawl.api_key_env
-            )
-        })?;
+        let firecrawl_domain = self
+            .firecrawl
+            .api_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("api.firecrawl.dev");
+
+        let guard = self
+            .credential_provider
+            .acquire(CredentialRequest {
+                secret_name: SecretName::new("web-fetch-firecrawl-api-key"),
+                target_domain: DomainScope::new(firecrawl_domain),
+                agent_id: AgentId::new(&self.agent_id),
+            })
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Firecrawl API key not available ({}): {e}",
+                    self.firecrawl.api_key_env
+                )
+            })?;
 
         let endpoint = format!("{}/scrape", self.firecrawl.api_url.trim_end_matches('/'));
 
@@ -129,11 +153,13 @@ impl WebFetchTool {
             "formats": ["markdown"]
         });
 
-        let response = client
-            .post(&endpoint)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
+        let response = guard.expose(|api_key| {
+            client
+                .post(&endpoint)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&body)
+        })
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("Firecrawl request failed: {e}"))?;
@@ -661,6 +687,19 @@ mod tests {
     use super::*;
     use crate::config::schema::FirecrawlConfig;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zerolease_provider::StaticProvider;
+
+    /// Build a test credential provider, optionally seeding a Firecrawl key.
+    fn test_provider(seed_firecrawl: bool) -> Arc<dyn CredentialProvider> {
+        let mut provider = StaticProvider::new();
+        if seed_firecrawl {
+            provider.insert(
+                SecretName::new("web-fetch-firecrawl-api-key"),
+                "test-firecrawl-key",
+            );
+        }
+        Arc::new(provider)
+    }
 
     fn test_tool(allowed_domains: Vec<&str>) -> WebFetchTool {
         test_tool_with_blocklist(allowed_domains, vec![])
@@ -682,6 +721,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
+            test_provider(false),
+            "test-agent".into(),
         )
     }
 
@@ -705,6 +746,8 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            test_provider(false),
+            "test-agent".into(),
         )
     }
 
@@ -721,6 +764,8 @@ mod tests {
             30,
             firecrawl,
             vec![],
+            test_provider(true),
+            "test-agent".into(),
         )
     }
 
@@ -820,6 +865,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
+            test_provider(false),
+            "test-agent".into(),
         );
         let err = tool
             .validate_url("https://example.com")
@@ -937,6 +984,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
+            test_provider(false),
+            "test-agent".into(),
         );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
@@ -960,6 +1009,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
+            test_provider(false),
+            "test-agent".into(),
         );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
@@ -988,6 +1039,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
+            test_provider(false),
+            "test-agent".into(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -1288,29 +1341,40 @@ mod tests {
         );
     }
 
-    // ── Item 1: missing API key env var falls back gracefully ─────────
+    // ── Item 1: missing API key falls back gracefully ─────────────────
 
     #[tokio::test]
     async fn firecrawl_missing_api_key_returns_error() {
-        // Ensure the env var is unset for this test
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY") };
-
-        let tool = test_tool_with_firecrawl(FirecrawlConfig {
-            enabled: true,
-            api_key_env: "FIRECRAWL_TEST_MISSING_KEY".into(),
-            ..FirecrawlConfig::default()
+        // Provider has no Firecrawl key seeded — acquire should fail.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
         });
+        let tool = WebFetchTool::new(
+            security,
+            vec!["*".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig {
+                enabled: true,
+                api_key_env: "FIRECRAWL_TEST_MISSING_KEY".into(),
+                ..FirecrawlConfig::default()
+            },
+            vec![],
+            test_provider(false), // no key seeded
+            "test-agent".into(),
+        );
 
         let result = tool.fetch_via_firecrawl("https://example.com").await;
         assert!(
             result.is_err(),
-            "fetch_via_firecrawl should return Err when API key env var is missing"
+            "fetch_via_firecrawl should return Err when API key is missing from provider"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("FIRECRAWL_TEST_MISSING_KEY"),
-            "Error should mention the missing env var name, got: {err_msg}"
+            "Error should mention the env var name, got: {err_msg}"
         );
     }
 
@@ -1330,10 +1394,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Ensure Firecrawl API key env is missing so fallback also fails
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY") };
-
+        // Provider has no Firecrawl key — fallback also fails.
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -1351,6 +1412,8 @@ mod tests {
                 ..FirecrawlConfig::default()
             },
             vec![],
+            test_provider(false), // no key seeded
+            "test-agent".into(),
         );
 
         // Bypass SSRF-guarded execute() — call standard_fetch + fallback
@@ -1417,9 +1480,13 @@ mod tests {
             .mount(&firecrawl_server)
             .await;
 
-        // Set up API key env var for this test
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345") };
+        // Seed the Firecrawl API key in the credential provider.
+        let mut provider = StaticProvider::new();
+        provider.insert(
+            SecretName::new("web-fetch-firecrawl-api-key"),
+            "test-key-12345",
+        );
+        let provider: Arc<dyn CredentialProvider> = Arc::new(provider);
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1440,6 +1507,8 @@ mod tests {
                 ..FirecrawlConfig::default()
             },
             vec![],
+            provider,
+            "test-agent".into(),
         );
 
         // Bypass SSRF-guarded execute() — call standard_fetch + fallback

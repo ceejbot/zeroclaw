@@ -5,9 +5,7 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-#[cfg(feature = "zerolease")]
-use zerolease_provider::{CredentialProvider, CredentialRequest};
+use zerolease_provider::{CredentialProvider, CredentialRequest, SecretName, DomainScope, AgentId};
 
 const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
 const MAX_ERROR_BODY_CHARS: usize = 500;
@@ -33,90 +31,66 @@ enum LevelOfDetails {
 pub struct JiraTool {
     base_url: String,
     email: String,
-    api_token: String,
     allowed_actions: Vec<String>,
     http: Client,
     security: Arc<SecurityPolicy>,
     timeout_secs: u64,
-    #[cfg(feature = "zerolease")]
-    credential_provider: Option<Arc<dyn CredentialProvider>>,
-    #[cfg(feature = "zerolease")]
-    agent_id: Option<String>,
+    credential_provider: Arc<dyn CredentialProvider>,
+    agent_id: String,
 }
 
 impl JiraTool {
     pub fn new(
         base_url: String,
         email: String,
-        api_token: String,
         allowed_actions: Vec<String>,
         security: Arc<SecurityPolicy>,
         timeout_secs: u64,
+        credential_provider: Arc<dyn CredentialProvider>,
+        agent_id: String,
     ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             email,
-            api_token,
             allowed_actions,
             http: Client::new(),
             security,
             timeout_secs,
-            #[cfg(feature = "zerolease")]
-            credential_provider: None,
-            #[cfg(feature = "zerolease")]
-            agent_id: None,
+            credential_provider,
+            agent_id,
         }
     }
 
-    /// Attach a zerolease credential provider. When set, credentials are
-    /// acquired per-request instead of using the static `api_token` field.
-    #[cfg(feature = "zerolease")]
-    pub fn with_credential_provider(
-        mut self,
-        provider: Arc<dyn CredentialProvider>,
-        agent_id: String,
-    ) -> Self {
-        self.credential_provider = Some(provider);
-        self.agent_id = Some(agent_id);
-        self
+    /// Extract the domain from the base URL for credential scoping.
+    fn domain(&self) -> &str {
+        self.base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or(&self.base_url)
     }
 
-    /// Apply authentication to a request builder.
-    ///
-    /// When a zerolease credential provider is configured, acquires a
-    /// credential per-request and applies it via `basic_auth`. Falls
-    /// back to the static `api_token` field otherwise.
+    /// Acquire a credential and apply `basic_auth` to the request builder,
+    /// then send it.
     async fn send_authenticated(
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, anyhow::Error> {
-        #[cfg(feature = "zerolease")]
-        if let (Some(provider), Some(agent_id)) = (&self.credential_provider, &self.agent_id) {
-            let domain = self
-                .base_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .split('/')
-                .next()
-                .unwrap_or(&self.base_url);
-            let guard = provider
-                .acquire(CredentialRequest {
-                    secret_name: "jira-api-token".to_string(),
-                    target_domain: domain.to_string(),
-                    agent_id: agent_id.clone(),
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))?;
-            let authed = guard.expose(|token| builder.basic_auth(&self.email, Some(token)));
-            return authed
-                .timeout(std::time::Duration::from_secs(self.timeout_secs))
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("request failed: {e}"));
-        }
+        let guard = self
+            .credential_provider
+            .acquire(CredentialRequest {
+                secret_name: SecretName::new("jira-api-token"),
+                target_domain: DomainScope::new(self.domain()),
+                agent_id: AgentId::new(&self.agent_id),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))?;
 
-        builder
-            .basic_auth(&self.email, Some(&self.api_token))
+        let email = self.email.clone();
+        let authed = guard.expose(|token| builder.basic_auth(&email, Some(token)));
+
+        authed
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .send()
             .await
@@ -376,14 +350,27 @@ impl JiraTool {
             let client = self.http.clone();
             let request_url = format!("{url}/{key}/statuses");
             let email = self.email.clone();
-            let token = self.api_token.clone();
+            let provider = self.credential_provider.clone();
+            let domain = self.domain().to_string();
+            let agent_id = self.agent_id.clone();
             let timeout = self.timeout_secs;
 
             set.spawn(async move {
                 let result = async {
-                    let resp = client
-                        .get(&request_url)
-                        .basic_auth(&email, Some(&token))
+                    let guard = provider
+                        .acquire(CredentialRequest {
+                            secret_name: SecretName::new("jira-api-token"),
+                            target_domain: DomainScope::new(&domain),
+                            agent_id: AgentId::new(&agent_id),
+                        })
+                        .await
+                        .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))?;
+
+                    let resp = guard.expose(|token| {
+                        client
+                            .get(&request_url)
+                            .basic_auth(&email, Some(token))
+                    })
                         .timeout(std::time::Duration::from_secs(timeout))
                         .send()
                         .await
@@ -991,17 +978,23 @@ mod tests {
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_tool(allowed_actions: Vec<&str>) -> JiraTool {
+        use zerolease_provider::StaticProvider;
+
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
         });
+        let mut provider = StaticProvider::new();
+        provider.insert(SecretName::new("jira-api-token"), "test-token");
+
         JiraTool::new(
             "https://test.atlassian.net".into(),
             "test@example.com".into(),
-            "test-token".into(),
             allowed_actions.into_iter().map(String::from).collect(),
             security,
             30,
+            Arc::new(provider),
+            "test-agent".into(),
         )
     }
 
@@ -1111,17 +1104,23 @@ mod tests {
 
     #[tokio::test]
     async fn execute_comment_blocked_in_readonly_mode() {
+        use zerolease_provider::StaticProvider;
+
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
+        let mut provider = StaticProvider::new();
+        provider.insert(SecretName::new("jira-api-token"), "test-token");
+
         let tool = JiraTool::new(
             "https://test.atlassian.net".into(),
             "test@example.com".into(),
-            "token".into(),
             vec!["get_ticket".into(), "comment_ticket".into()],
             security,
             30,
+            Arc::new(provider),
+            "test-agent".into(),
         );
         let result = tool
             .execute(json!({
@@ -1159,6 +1158,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_myself_not_blocked_in_readonly_mode() {
+        use zerolease_provider::StaticProvider;
+
         // myself is a Read operation — the security policy should not block it.
         // The call will fail at the HTTP level (no real server), not at the
         // policy level, so the error must NOT contain "read-only".
@@ -1166,13 +1167,17 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
+        let mut provider = StaticProvider::new();
+        provider.insert(SecretName::new("jira-api-token"), "test-token");
+
         let tool = JiraTool::new(
             "https://test.atlassian.net".into(),
             "test@example.com".into(),
-            "token".into(),
             vec!["myself".into()],
             security,
             30,
+            Arc::new(provider),
+            "test-agent".into(),
         );
         let result = tool.execute(json!({"action": "myself"})).await.unwrap();
         assert!(!result.success);
@@ -1431,17 +1436,23 @@ mod tests {
 
     #[tokio::test]
     async fn execute_list_projects_not_blocked_in_readonly_mode() {
+        use zerolease_provider::StaticProvider;
+
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
+        let mut provider = StaticProvider::new();
+        provider.insert(SecretName::new("jira-api-token"), "test-token");
+
         let tool = JiraTool::new(
             "https://127.0.0.1:1".into(),
             "test@example.com".into(),
-            "token".into(),
             vec!["list_projects".into()],
             security,
             30,
+            Arc::new(provider),
+            "test-agent".into(),
         );
         let result = tool
             .execute(json!({"action": "list_projects"}))
@@ -1557,11 +1568,12 @@ mod tests {
     /// Proves JiraTool can acquire credentials through a `CredentialProvider`
     /// instead of using static fields. The HTTP request will fail (no real
     /// Jira server) but the credential acquisition path is exercised.
-    #[cfg(feature = "zerolease")]
     #[tokio::test]
     async fn execute_with_credential_provider_acquires_from_provider() {
-        let mut provider = zerolease_provider::StaticProvider::new();
-        provider.insert("jira-api-token", "vault-provided-token");
+        use zerolease_provider::StaticProvider;
+
+        let mut provider = StaticProvider::new();
+        provider.insert(SecretName::new("jira-api-token"), "vault-provided-token");
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1571,12 +1583,12 @@ mod tests {
             // Use a non-routable address so we get a connection error, not a DNS lookup
             "https://127.0.0.1:1".into(),
             "test@example.com".into(),
-            "static-token-should-not-be-used".into(),
             vec!["myself".into()],
             security,
             2,
-        )
-        .with_credential_provider(Arc::new(provider), "test-agent".into());
+            Arc::new(provider),
+            "test-agent".into(),
+        );
 
         let result = tool
             .execute(serde_json::json!({ "action": "myself" }))
@@ -1595,10 +1607,11 @@ mod tests {
     }
 
     /// Proves that `StaticProvider` returns an error for unknown secrets.
-    #[cfg(feature = "zerolease")]
     #[tokio::test]
     async fn credential_provider_rejects_unknown_secret() {
-        let provider = zerolease_provider::StaticProvider::new(); // empty
+        use zerolease_provider::StaticProvider;
+
+        let provider = StaticProvider::new(); // empty
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1607,12 +1620,12 @@ mod tests {
         let tool = JiraTool::new(
             "https://127.0.0.1:1".into(),
             "test@example.com".into(),
-            "unused".into(),
             vec!["myself".into()],
             security,
             2,
-        )
-        .with_credential_provider(Arc::new(provider), "test-agent".into());
+            Arc::new(provider),
+            "test-agent".into(),
+        );
 
         let result = tool
             .execute(serde_json::json!({ "action": "myself" }))

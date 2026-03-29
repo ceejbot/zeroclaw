@@ -58,3 +58,4 @@ playground/
 
 # Temporary rustc output
 rust_out
+.config/

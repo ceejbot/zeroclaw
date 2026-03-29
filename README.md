@@ -2,6 +2,13 @@
   <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
 </p>
 
+<p align="center">
+  <strong>⚠️ This is a personal fork — not the official project.</strong><br>
+  For the real ZeroClaw, visit <a href="https://github.com/zeroclaw-labs/zeroclaw">zeroclaw-labs/zeroclaw</a>.
+</p>
+
+<hr>
+
 <h1 align="center">🦀 ZeroClaw — Personal AI Assistant</h1>
 
 <p align="center">

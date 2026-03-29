@@ -3,6 +3,7 @@ use crate::security::{SecurityPolicy, policy::ToolOperation};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use zerolease_provider::{CredentialProvider, CredentialRequest, SecretName, DomainScope, AgentId};
 
 const NOTION_API_BASE: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2022-06-28";
@@ -14,33 +15,51 @@ const MAX_ERROR_BODY_CHARS: usize = 500;
 /// and search the workspace. Each action is gated by the appropriate security operation
 /// (Read for queries, Act for mutations).
 pub struct NotionTool {
-    api_key: String,
     http: reqwest::Client,
     security: Arc<SecurityPolicy>,
+    credential_provider: Arc<dyn CredentialProvider>,
+    agent_id: String,
 }
 
 impl NotionTool {
-    /// Create a new Notion tool with the given API key and security policy.
-    pub fn new(api_key: String, security: Arc<SecurityPolicy>) -> Self {
+    /// Create a new Notion tool with the given security policy and credential provider.
+    pub fn new(
+        security: Arc<SecurityPolicy>,
+        credential_provider: Arc<dyn CredentialProvider>,
+        agent_id: String,
+    ) -> Self {
         Self {
-            api_key,
             http: reqwest::Client::new(),
             security,
+            credential_provider,
+            agent_id,
         }
     }
 
     /// Build the standard Notion API headers (Authorization, version, content-type).
-    fn headers(&self) -> anyhow::Result<reqwest::header::HeaderMap> {
+    fn build_headers(token: &str) -> anyhow::Result<reqwest::header::HeaderMap> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "Authorization",
-            format!("Bearer {}", self.api_key)
+            format!("Bearer {token}")
                 .parse()
                 .map_err(|e| anyhow::anyhow!("Invalid Notion API key header value: {e}"))?,
         );
         headers.insert("Notion-Version", NOTION_VERSION.parse().unwrap());
         headers.insert("Content-Type", "application/json".parse().unwrap());
         Ok(headers)
+    }
+
+    /// Acquire a credential guard for the Notion API key.
+    async fn acquire_credential(&self) -> anyhow::Result<zerolease_provider::CredentialGuard> {
+        self.credential_provider
+            .acquire(CredentialRequest {
+                secret_name: SecretName::new("notion-api-key"),
+                target_domain: DomainScope::new("api.notion.com"),
+                agent_id: AgentId::new(&self.agent_id),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))
     }
 
     /// Query a Notion database with an optional filter.
@@ -54,10 +73,12 @@ impl NotionTool {
         if let Some(f) = filter {
             body["filter"] = f.clone();
         }
+        let guard = self.acquire_credential().await?;
+        let headers = guard.expose(|token| Self::build_headers(token))?;
         let resp = self
             .http
             .post(&url)
-            .headers(self.headers()?)
+            .headers(headers)
             .json(&body)
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
@@ -74,10 +95,12 @@ impl NotionTool {
     /// Read a single Notion page by ID.
     async fn read_page(&self, page_id: &str) -> anyhow::Result<serde_json::Value> {
         let url = format!("{NOTION_API_BASE}/pages/{page_id}");
+        let guard = self.acquire_credential().await?;
+        let headers = guard.expose(|token| Self::build_headers(token))?;
         let resp = self
             .http
             .get(&url)
-            .headers(self.headers()?)
+            .headers(headers)
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
             .await?;
@@ -101,10 +124,12 @@ impl NotionTool {
         if let Some(db_id) = database_id {
             body["parent"] = json!({ "database_id": db_id });
         }
+        let guard = self.acquire_credential().await?;
+        let headers = guard.expose(|token| Self::build_headers(token))?;
         let resp = self
             .http
             .post(&url)
-            .headers(self.headers()?)
+            .headers(headers)
             .json(&body)
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
@@ -126,10 +151,12 @@ impl NotionTool {
     ) -> anyhow::Result<serde_json::Value> {
         let url = format!("{NOTION_API_BASE}/pages/{page_id}");
         let body = json!({ "properties": properties });
+        let guard = self.acquire_credential().await?;
+        let headers = guard.expose(|token| Self::build_headers(token))?;
         let resp = self
             .http
             .patch(&url)
-            .headers(self.headers()?)
+            .headers(headers)
             .json(&body)
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
@@ -147,10 +174,12 @@ impl NotionTool {
     async fn search(&self, query: &str) -> anyhow::Result<serde_json::Value> {
         let url = format!("{NOTION_API_BASE}/search");
         let body = json!({ "query": query });
+        let guard = self.acquire_credential().await?;
+        let headers = guard.expose(|token| Self::build_headers(token))?;
         let resp = self
             .http
             .post(&url)
-            .headers(self.headers()?)
+            .headers(headers)
             .json(&body)
             .timeout(std::time::Duration::from_secs(NOTION_REQUEST_TIMEOUT_SECS))
             .send()
@@ -335,10 +364,13 @@ impl Tool for NotionTool {
 mod tests {
     use super::*;
     use crate::security::SecurityPolicy;
+    use zerolease_provider::StaticProvider;
 
     fn test_tool() -> NotionTool {
         let security = Arc::new(SecurityPolicy::default());
-        NotionTool::new("test-key".into(), security)
+        let mut provider = StaticProvider::new();
+        provider.insert(SecretName::new("notion-api-key"), "test-key");
+        NotionTool::new(security, Arc::new(provider), "test-agent".into())
     }
 
     #[test]
@@ -434,5 +466,19 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("properties"));
+    }
+
+    #[tokio::test]
+    async fn headers_use_credential_provider() {
+        let mut provider = StaticProvider::new();
+        provider.insert(SecretName::new("notion-api-key"), "notion-test-key");
+
+        let tool = NotionTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(provider),
+            "test-agent".into(),
+        );
+
+        assert_eq!(tool.name(), "notion");
     }
 }

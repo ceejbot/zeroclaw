@@ -6,17 +6,22 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use zerolease_provider::{AgentId, CredentialProvider, CredentialRequest, DomainScope, SecretName};
 
 /// Standalone image generation tool using fal.ai (Flux / Nano Banana models).
 ///
-/// Reads the API key from an environment variable (default: `FAL_API_KEY`),
-/// calls the fal.ai synchronous endpoint, downloads the resulting image,
-/// and saves it to `{workspace}/images/{filename}.png`.
+/// Acquires the API key via a `CredentialProvider` at request time
+/// (secret name: `"image-gen-fal-api-key"`), calls the fal.ai synchronous
+/// endpoint, downloads the resulting image, and saves it to
+/// `{workspace}/images/{filename}.png`.
 pub struct ImageGenTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
     default_model: String,
+    /// Env var name retained for error messages only.
     api_key_env: String,
+    credential_provider: Arc<dyn CredentialProvider>,
+    agent_id: String,
 }
 
 impl ImageGenTool {
@@ -25,12 +30,16 @@ impl ImageGenTool {
         workspace_dir: PathBuf,
         default_model: String,
         api_key_env: String,
+        credential_provider: Arc<dyn CredentialProvider>,
+        agent_id: String,
     ) -> Self {
         Self {
             security,
             workspace_dir,
             default_model,
             api_key_env,
+            credential_provider,
+            agent_id,
         }
     }
 
@@ -42,7 +51,8 @@ impl ImageGenTool {
             .unwrap_or_default()
     }
 
-    /// Read an API key from the environment.
+    /// Read an API key from the environment (used only in tests).
+    #[cfg(test)]
     fn read_api_key(env_var: &str) -> Result<String, String> {
         std::env::var(env_var)
             .map(|v| v.trim().to_string())
@@ -126,14 +136,25 @@ impl ImageGenTool {
             });
         }
 
-        // ── Read API key ───────────────────────────────────────────
-        let api_key = match Self::read_api_key(&self.api_key_env) {
-            Ok(k) => k,
-            Err(msg) => {
+        // ── Acquire API key via credential provider ──────────────────
+        let guard = match self
+            .credential_provider
+            .acquire(CredentialRequest {
+                secret_name: SecretName::new("image-gen-fal-api-key"),
+                target_domain: DomainScope::new("fal.run"),
+                agent_id: AgentId::new(&self.agent_id),
+            })
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(msg),
+                    error: Some(format!(
+                        "Missing API key ({}): {e}",
+                        self.api_key_env
+                    )),
                 });
             }
         };
@@ -148,11 +169,13 @@ impl ImageGenTool {
             "num_images": 1
         });
 
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Key {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
+        let resp = guard.expose(|api_key| {
+            client
+                .post(&url)
+                .header("Authorization", format!("Key {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&body)
+        })
             .send()
             .await
             .context("fal.ai request failed")?;
@@ -289,6 +312,7 @@ impl Tool for ImageGenTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zerolease_provider::StaticProvider;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -298,12 +322,23 @@ mod tests {
         })
     }
 
+    /// Build a StaticProvider with an optional seeded key.
+    fn test_provider(seed_key: bool) -> Arc<dyn CredentialProvider> {
+        let mut provider = StaticProvider::new();
+        if seed_key {
+            provider.insert(SecretName::new("image-gen-fal-api-key"), "dummy_key");
+        }
+        Arc::new(provider)
+    }
+
     fn test_tool() -> ImageGenTool {
         ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY".into(),
+            test_provider(true),
+            "test-agent".into(),
         )
     }
 
@@ -363,16 +398,14 @@ mod tests {
 
     #[tokio::test]
     async fn missing_api_key_returns_error() {
-        // Temporarily ensure the env var is unset.
-        let original = std::env::var("FAL_API_KEY_TEST_IMAGE_GEN").ok();
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("FAL_API_KEY_TEST_IMAGE_GEN") };
-
+        // Provider with no seeded key — acquire should fail.
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY_TEST_IMAGE_GEN".into(),
+            test_provider(false),
+            "test-agent".into(),
         );
         let result = tool
             .execute(json!({"prompt": "a sunset over the ocean"}))
@@ -386,25 +419,17 @@ mod tests {
                 .unwrap()
                 .contains("FAL_API_KEY_TEST_IMAGE_GEN")
         );
-
-        // Restore if it was set.
-        if let Some(val) = original {
-            // SAFETY: test-only, single-threaded test runner.
-            unsafe { std::env::set_var("FAL_API_KEY_TEST_IMAGE_GEN", val) };
-        }
     }
 
     #[tokio::test]
     async fn invalid_size_returns_error() {
-        // Set a dummy key so we get past the key check.
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("FAL_API_KEY_TEST_SIZE", "dummy_key") };
-
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY_TEST_SIZE".into(),
+            test_provider(true),
+            "test-agent".into(),
         );
         let result = tool
             .execute(json!({"prompt": "test", "size": "invalid_size"}))
@@ -412,9 +437,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("Invalid size"));
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("FAL_API_KEY_TEST_SIZE") };
     }
 
     #[tokio::test]
@@ -429,6 +451,8 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY".into(),
+            test_provider(true),
+            "test-agent".into(),
         );
         let result = tool.execute(json!({"prompt": "test image"})).await.unwrap();
         assert!(!result.success);
@@ -441,14 +465,13 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_model_with_traversal_returns_error() {
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("FAL_API_KEY_TEST_MODEL", "dummy_key") };
-
         let tool = ImageGenTool::new(
             test_security(),
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY_TEST_MODEL".into(),
+            test_provider(true),
+            "test-agent".into(),
         );
         let result = tool
             .execute(json!({"prompt": "test", "model": "../../evil-endpoint"}))
@@ -462,9 +485,6 @@ mod tests {
                 .unwrap()
                 .contains("Invalid model identifier")
         );
-
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::remove_var("FAL_API_KEY_TEST_MODEL") };
     }
 
     #[test]
