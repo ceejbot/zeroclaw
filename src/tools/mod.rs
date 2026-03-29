@@ -221,6 +221,38 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use zerolease_provider::{CredentialProvider, SecretName, StaticProvider};
+
+/// Build a credential provider seeded with all known tool credentials.
+///
+/// When zerolease is enabled and a vault socket is configured, returns a
+/// `ZeroleaseProvider`. Otherwise returns a `StaticProvider` populated
+/// from config values — same behavior as today, but behind the
+/// `CredentialProvider` trait so tools don't know the difference.
+pub fn build_credential_provider(
+    zerolease_enabled: bool,
+    zerolease_socket_path: &str,
+    _agent_id: &str,
+    credentials: &[(&str, &str)],
+) -> Arc<dyn CredentialProvider> {
+    #[cfg(feature = "zerolease")]
+    if zerolease_enabled && !zerolease_socket_path.is_empty() {
+        return Arc::new(
+            zerolease_provider::ZeroleaseProvider::new(zerolease_socket_path),
+        );
+    }
+
+    // Suppress unused-variable warnings when the vault feature is off.
+    let _ = (zerolease_enabled, zerolease_socket_path);
+
+    let mut provider = StaticProvider::new();
+    for (name, value) in credentials {
+        if !value.is_empty() {
+            provider.insert(SecretName::new(*name), *value);
+        }
+    }
+    Arc::new(provider)
+}
 
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
@@ -407,6 +439,69 @@ pub fn all_tools_with_runtime(
     Option<ChannelMapHandle>,
     Option<ChannelMapHandle>,
 ) {
+    // --- Credential provider construction ---
+    // Collect all tool credentials from config (with env var fallbacks)
+    let mut cred_pairs: Vec<(&str, String)> = Vec::new();
+
+    // Jira
+    if root_config.jira.enabled {
+        let jira_token = if root_config.jira.api_token.trim().is_empty() {
+            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
+        } else {
+            root_config.jira.api_token.trim().to_string()
+        };
+        cred_pairs.push(("jira-api-token", jira_token));
+    }
+
+    // Notion
+    if root_config.notion.enabled {
+        let notion_key = if root_config.notion.api_key.trim().is_empty() {
+            std::env::var("NOTION_API_KEY").unwrap_or_default()
+        } else {
+            root_config.notion.api_key.trim().to_string()
+        };
+        cred_pairs.push(("notion-api-key", notion_key));
+    }
+
+    // Composio
+    if let Some(key) = composio_key {
+        cred_pairs.push(("composio-api-key", key.to_string()));
+    }
+
+    // Browser (computer-use sidecar)
+    if let Some(ref key) = browser_config.computer_use.api_key {
+        cred_pairs.push(("browser-cu-api-key", key.clone()));
+    }
+
+    // ImageGen — seed from env var (name comes from config)
+    if let Ok(val) = std::env::var(&root_config.image_gen.api_key_env) {
+        let trimmed = val.trim().to_string();
+        if !trimmed.is_empty() {
+            cred_pairs.push(("image-gen-fal-api-key", trimmed));
+        }
+    }
+
+    // WebFetch — Firecrawl API key from env var
+    if let Ok(val) = std::env::var(&root_config.web_fetch.firecrawl.api_key_env) {
+        let trimmed = val.trim().to_string();
+        if !trimmed.is_empty() {
+            cred_pairs.push(("web-fetch-firecrawl-api-key", trimmed));
+        }
+    }
+
+    // Build the provider
+    let cred_refs: Vec<(&str, &str)> = cred_pairs
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    let credential_provider = build_credential_provider(
+        root_config.zerolease.enabled,
+        &root_config.zerolease.socket_path,
+        &root_config.zerolease.agent_id,
+        &cred_refs,
+    );
+    let agent_id = root_config.zerolease.agent_id.clone();
+
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
@@ -516,13 +611,13 @@ pub fn all_tools_with_runtime(
             browser_config.native_chrome_path.clone(),
             ComputerUseConfig {
                 endpoint: browser_config.computer_use.endpoint.clone(),
-                api_key: browser_config.computer_use.api_key.clone(),
                 timeout_ms: browser_config.computer_use.timeout_ms,
                 allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
                 window_allowlist: browser_config.computer_use.window_allowlist.clone(),
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+            credential_provider.clone(),
         )));
     }
 
@@ -559,6 +654,8 @@ pub fn all_tools_with_runtime(
             web_fetch_config.timeout_secs,
             web_fetch_config.firecrawl.clone(),
             web_fetch_config.allowed_private_hosts.clone(),
+            credential_provider.clone(),
+            agent_id.clone(),
         )));
     }
 
@@ -586,32 +683,16 @@ pub fn all_tools_with_runtime(
 
     // Notion API tool (conditionally registered)
     if root_config.notion.enabled {
-        let notion_api_key = if root_config.notion.api_key.trim().is_empty() {
-            std::env::var("NOTION_API_KEY").unwrap_or_default()
-        } else {
-            root_config.notion.api_key.trim().to_string()
-        };
-        if notion_api_key.trim().is_empty() {
-            tracing::warn!(
-                "Notion tool enabled but no API key found (set notion.api_key or NOTION_API_KEY env var)"
-            );
-        } else {
-            tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
-        }
+        tool_arcs.push(Arc::new(NotionTool::new(
+            security.clone(),
+            credential_provider.clone(),
+            agent_id.clone(),
+        )));
     }
 
     // Jira integration (config-gated)
     if root_config.jira.enabled {
-        let api_token = if root_config.jira.api_token.trim().is_empty() {
-            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
-        } else {
-            root_config.jira.api_token.trim().to_string()
-        };
-        if api_token.trim().is_empty() {
-            tracing::warn!(
-                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
-            );
-        } else if root_config.jira.base_url.trim().is_empty() {
+        if root_config.jira.base_url.trim().is_empty() {
             tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
         } else if root_config.jira.email.trim().is_empty() {
             tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
@@ -619,22 +700,12 @@ pub fn all_tools_with_runtime(
             let jira = JiraTool::new(
                 root_config.jira.base_url.trim().to_string(),
                 root_config.jira.email.trim().to_string(),
-                api_token,
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
+                credential_provider.clone(),
+                agent_id.clone(),
             );
-            #[cfg(feature = "zerolease")]
-            let jira = if root_config.zerolease.enabled
-                && !root_config.zerolease.socket_path.is_empty()
-            {
-                let provider = Arc::new(
-                    zerolease_provider::ZeroleaseProvider::new(&root_config.zerolease.socket_path),
-                );
-                jira.with_credential_provider(provider, root_config.zerolease.agent_id.clone())
-            } else {
-                jira
-            };
             tool_arcs.push(Arc::new(jira));
         }
     }
@@ -779,6 +850,8 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
+            credential_provider.clone(),
+            agent_id.clone(),
         )));
     }
 
@@ -801,14 +874,13 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
     }
 
-    if let Some(key) = composio_key {
-        if !key.is_empty() {
-            tool_arcs.push(Arc::new(ComposioTool::new(
-                key,
-                composio_entity_id,
-                security.clone(),
-            )));
-        }
+    if composio_key.is_some_and(|k| !k.is_empty()) {
+        tool_arcs.push(Arc::new(ComposioTool::new(
+            composio_entity_id,
+            security.clone(),
+            credential_provider.clone(),
+            agent_id.clone(),
+        )));
     }
 
     // Emoji reaction tool — always registered; channel map populated later by start_channels.
@@ -1411,5 +1483,54 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
+    }
+}
+
+#[cfg(test)]
+mod credential_provider_tests {
+    use zerolease_provider::{AgentId, CredentialRequest, DomainScope, SecretName};
+
+    use super::build_credential_provider;
+
+    #[tokio::test]
+    async fn static_provider_returns_seeded_credentials() {
+        let provider = build_credential_provider(
+            false,  // zerolease not enabled
+            "",     // no socket path
+            "test-agent",
+            &[
+                ("jira-api-token", "jira-secret-123"),
+                ("notion-api-key", "notion-secret-456"),
+            ],
+        );
+
+        let guard = provider
+            .acquire(CredentialRequest {
+                secret_name: SecretName::new("jira-api-token"),
+                target_domain: DomainScope::new("test.atlassian.net"),
+                agent_id: AgentId::new("test-agent"),
+            })
+            .await
+            .expect("should resolve jira credential");
+
+        let value = guard.expose(|s| s.to_string());
+        assert_eq!(value, "jira-secret-123");
+    }
+
+    #[tokio::test]
+    async fn static_provider_returns_error_for_unknown_secret() {
+        let provider = build_credential_provider(
+            false, "", "test-agent", &[],
+        );
+
+        let result = provider
+            .acquire(CredentialRequest {
+                secret_name: SecretName::new("nonexistent"),
+                target_domain: DomainScope::new("example.com"),
+                agent_id: AgentId::new("test-agent"),
+            })
+            .await;
+
+        assert!(result.is_err());
     }
 }

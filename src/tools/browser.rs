@@ -17,12 +17,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
+use zerolease_provider::{AgentId, CredentialProvider, CredentialRequest, DomainScope, SecretName};
 
 /// Computer-use sidecar settings.
 #[derive(Clone)]
 pub struct ComputerUseConfig {
     pub endpoint: String,
-    pub api_key: Option<String>,
     pub timeout_ms: u64,
     pub allow_remote_endpoint: bool,
     pub window_allowlist: Vec<String>,
@@ -47,7 +47,6 @@ impl Default for ComputerUseConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://127.0.0.1:8787/v1/actions".into(),
-            api_key: None,
             timeout_ms: 15_000,
             allow_remote_endpoint: false,
             window_allowlist: Vec::new(),
@@ -67,6 +66,7 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    credential_provider: Arc<dyn CredentialProvider>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -211,6 +211,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Arc::new(zerolease_provider::StaticProvider::new()),
         )
     }
 
@@ -224,6 +225,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        credential_provider: Arc<dyn CredentialProvider>,
     ) -> Self {
         Self {
             security,
@@ -234,6 +236,7 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            credential_provider,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -796,10 +799,27 @@ impl BrowserTool {
             .timeout(Duration::from_millis(self.computer_use.timeout_ms))
             .json(&payload);
 
-        if let Some(api_key) = self.computer_use.api_key.as_deref() {
-            let token = api_key.trim();
-            if !token.is_empty() {
-                request = request.bearer_auth(token);
+        match self
+            .credential_provider
+            .acquire(CredentialRequest {
+                secret_name: SecretName::new("browser-cu-api-key"),
+                target_domain: DomainScope::new("localhost"),
+                agent_id: AgentId::new("zeroclaw"),
+            })
+            .await
+        {
+            Ok(guard) => {
+                request = guard.expose(|token| {
+                    let trimmed = token.trim();
+                    if !trimmed.is_empty() {
+                        request.bearer_auth(trimmed)
+                    } else {
+                        request
+                    }
+                });
+            }
+            Err(_) => {
+                // No credential configured — skip auth (matches prior behavior when api_key was None)
             }
         }
 
@@ -2198,6 +2218,10 @@ fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    fn test_provider() -> Arc<dyn CredentialProvider> {
+        Arc::new(zerolease_provider::StaticProvider::new())
+    }
+
     #[test]
     fn normalize_domains_works() {
         let domains = vec![
@@ -2366,6 +2390,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            test_provider(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
@@ -2382,6 +2407,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            test_provider(),
         );
         assert_eq!(
             tool.configured_backend().unwrap(),
@@ -2404,6 +2430,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            test_provider(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_err());
@@ -2425,6 +2452,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            test_provider(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_ok());
@@ -2446,6 +2474,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            test_provider(),
         );
 
         assert!(
