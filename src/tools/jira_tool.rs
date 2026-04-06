@@ -83,6 +83,8 @@ impl JiraTool {
                 secret_name: SecretName::new("jira-api-token"),
                 target_domain: DomainScope::new(self.domain()),
                 agent_id: AgentId::new(&self.agent_id),
+                session_token: None,
+                tool_name: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))?;
@@ -362,6 +364,8 @@ impl JiraTool {
                             secret_name: SecretName::new("jira-api-token"),
                             target_domain: DomainScope::new(&domain),
                             agent_id: AgentId::new(&agent_id),
+                            session_token: None,
+                            tool_name: None,
                         })
                         .await
                         .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))?;

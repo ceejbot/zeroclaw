@@ -805,6 +805,8 @@ impl BrowserTool {
                 secret_name: SecretName::new("browser-cu-api-key"),
                 target_domain: DomainScope::new("localhost"),
                 agent_id: AgentId::new("zeroclaw"),
+                session_token: None,
+                tool_name: None,
             })
             .await
         {

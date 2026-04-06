@@ -132,6 +132,8 @@ impl WebFetchTool {
                 secret_name: SecretName::new("web-fetch-firecrawl-api-key"),
                 target_domain: DomainScope::new(firecrawl_domain),
                 agent_id: AgentId::new(&self.agent_id),
+                session_token: None,
+                tool_name: None,
             })
             .await
             .map_err(|e| {

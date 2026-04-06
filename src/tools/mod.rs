@@ -1509,6 +1509,8 @@ mod credential_provider_tests {
                 secret_name: SecretName::new("jira-api-token"),
                 target_domain: DomainScope::new("test.atlassian.net"),
                 agent_id: AgentId::new("test-agent"),
+                session_token: None,
+                tool_name: None,
             })
             .await
             .expect("should resolve jira credential");
@@ -1528,6 +1530,8 @@ mod credential_provider_tests {
                 secret_name: SecretName::new("nonexistent"),
                 target_domain: DomainScope::new("example.com"),
                 agent_id: AgentId::new("test-agent"),
+                session_token: None,
+                tool_name: None,
             })
             .await;
 

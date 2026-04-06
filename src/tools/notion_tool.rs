@@ -57,6 +57,8 @@ impl NotionTool {
                 secret_name: SecretName::new("notion-api-key"),
                 target_domain: DomainScope::new("api.notion.com"),
                 agent_id: AgentId::new(&self.agent_id),
+                session_token: None,
+                tool_name: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!("credential acquisition failed: {e}"))
